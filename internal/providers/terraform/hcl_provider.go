@@ -7,16 +7,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/gocty"
 	ctyJson "github.com/zclconf/go-cty/cty/json"
 
 	"github.com/infracost/infracost/internal/config"
 	"github.com/infracost/infracost/internal/hcl"
 	"github.com/infracost/infracost/internal/hcl/modules"
+	"github.com/infracost/infracost/internal/logging"
 	"github.com/infracost/infracost/internal/schema"
 	"github.com/infracost/infracost/internal/ui"
 )
@@ -24,6 +25,7 @@ import (
 type HCLProvider struct {
 	parsers        []*hcl.Parser
 	planJSONParser *Parser
+	logger         *log.Entry
 
 	schema      *PlanSchema
 	providerKey string
@@ -116,9 +118,14 @@ func NewHCLProvider(ctx *config.ProjectContext, config *HCLProviderConfig, opts 
 			localWorkspace),
 		)
 	}
-	options = append(options, hcl.OptionWithCredentialsSource(credsSource))
 
-	parsers, err := hcl.LoadParsers(ctx.ProjectConfig.Path, ctx.ProjectConfig.ExcludePaths, options...)
+	options = append(options,
+		hcl.OptionWithTerraformWorkspace(localWorkspace),
+		hcl.OptionWithCredentialsSource(credsSource),
+	)
+
+	logger := ctx.Logger().WithFields(log.Fields{"provider": "terraform_dir"})
+	parsers, err := hcl.LoadParsers(ctx.ProjectConfig.Path, ctx.ProjectConfig.ExcludePaths, logger, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +135,7 @@ func NewHCLProvider(ctx *config.ProjectContext, config *HCLProviderConfig, opts 
 		planJSONParser: NewParser(ctx, false),
 		ctx:            ctx,
 		config:         *config,
+		logger:         logger,
 	}, err
 }
 
@@ -141,7 +149,7 @@ func (p *HCLProvider) AddMetadata(metadata *schema.ProjectMetadata) {
 
 	modulePath, err := filepath.Rel(basePath, metadata.Path)
 	if err == nil && modulePath != "" && modulePath != "." {
-		log.Debugf("Calculated relative terraformModulePath for %s from %s", basePath, metadata.Path)
+		p.logger.Debugf("calculated relative terraformModulePath for %s from %s", basePath, metadata.Path)
 		metadata.TerraformModulePath = modulePath
 	}
 
@@ -370,7 +378,7 @@ func (p *HCLProvider) getResourceOutput(block *hcl.Block) ResourceOutput {
 	}
 
 	jsonValues := marshalAttributeValues(block.Type(), block.Values())
-	marshalBlock(block, jsonValues)
+	p.marshalBlock(block, jsonValues)
 
 	changes.Change.After = jsonValues
 	planned.Values = jsonValues
@@ -378,14 +386,14 @@ func (p *HCLProvider) getResourceOutput(block *hcl.Block) ResourceOutput {
 	providerConfigKey := p.providerKey
 	providerAttr := block.GetAttribute("provider")
 	if providerAttr != nil {
-		value := providerAttr.Value()
 		r, err := providerAttr.Reference()
 		if err == nil {
 			providerConfigKey = r.String()
 		}
 
-		if err != nil && value.Type() == cty.String {
-			providerConfigKey = value.AsString()
+		value := providerAttr.AsString()
+		if err != nil && value != "" {
+			providerConfigKey = value
 		}
 	}
 
@@ -398,7 +406,7 @@ func (p *HCLProvider) getResourceOutput(block *hcl.Block) ResourceOutput {
 			Name:              stripCount(block.NameLabel()),
 			ProviderConfigKey: block.ModuleName() + ":" + block.Provider(),
 			Expressions:       blockToReferences(block),
-			CountExpression:   countReferences(block),
+			CountExpression:   p.countReferences(block),
 		}
 	} else {
 		configuration = ResourceData{
@@ -408,7 +416,7 @@ func (p *HCLProvider) getResourceOutput(block *hcl.Block) ResourceOutput {
 			Name:              stripCount(block.NameLabel()),
 			ProviderConfigKey: providerConfigKey,
 			Expressions:       blockToReferences(block),
-			CountExpression:   countReferences(block),
+			CountExpression:   p.countReferences(block),
 		}
 	}
 
@@ -422,14 +430,10 @@ func (p *HCLProvider) getResourceOutput(block *hcl.Block) ResourceOutput {
 func (p *HCLProvider) marshalProviderBlock(block *hcl.Block) string {
 	name := block.TypeLabel()
 	if a := block.GetAttribute("alias"); a != nil {
-		name = name + "." + a.Value().AsString()
+		name = name + "." + a.AsString()
 	}
 
-	region := ""
-	value := block.GetAttribute("region").Value()
-	if value != cty.NilVal {
-		region = value.AsString()
-	}
+	region := block.GetAttribute("region").AsString()
 
 	p.schema.Configuration.ProviderConfig[name] = ProviderConfig{
 		Name: name,
@@ -447,7 +451,7 @@ func (p *HCLProvider) marshalProviderBlock(block *hcl.Block) string {
 	return name
 }
 
-func countReferences(block *hcl.Block) *countExpression {
+func (p *HCLProvider) countReferences(block *hcl.Block) *countExpression {
 	for _, attribute := range block.GetAttributes() {
 		name := attribute.Name()
 		if name != "count" {
@@ -468,19 +472,7 @@ func countReferences(block *hcl.Block) *countExpression {
 			return &exp
 		}
 
-		v := attribute.Value()
-		ty := v.Type()
-		var i int64
-		switch ty {
-		case cty.Number:
-			i, _ = v.AsBigFloat().Int64()
-		case cty.String:
-			s := v.AsString()
-			i, _ = strconv.ParseInt(s, 10, 64)
-		default:
-			log.Debugf("unsupported go cty type %s expected either Number or String for count expression, using 0", ty)
-		}
-
+		i := attribute.AsInt()
 		exp.ConstantValue = &i
 		return &exp
 	}
@@ -529,7 +521,7 @@ func blockToReferences(block *hcl.Block) map[string]interface{} {
 	return expressionValues
 }
 
-func marshalBlock(block *hcl.Block, jsonValues map[string]interface{}) {
+func (p *HCLProvider) marshalBlock(block *hcl.Block, jsonValues map[string]interface{}) {
 	for _, b := range block.Children() {
 		key := b.Type()
 		if key == "dynamic" || key == "depends_on" {
@@ -538,10 +530,19 @@ func marshalBlock(block *hcl.Block, jsonValues map[string]interface{}) {
 
 		childValues := marshalAttributeValues(key, b.Values())
 		if len(b.Children()) > 0 {
-			marshalBlock(b, childValues)
+			p.marshalBlock(b, childValues)
 		}
 
 		if v, ok := jsonValues[key]; ok {
+			if _, ok := v.(json.RawMessage); ok {
+				p.logger.WithFields(log.Fields{
+					"parent_block": block.LocalName(),
+					"child_block":  b.LocalName(),
+				}).Debugf("skipping attribute '%s' that has also been declared as a child block", key)
+
+				continue
+			}
+
 			jsonValues[key] = append(v.([]interface{}), childValues)
 			continue
 		}
@@ -560,7 +561,12 @@ func marshalAttributeValues(blockType string, value cty.Value) map[string]interf
 	for it.Next() {
 		k, v := it.Element()
 		vJSON, _ := ctyJson.Marshal(v, v.Type())
-		key := k.AsString()
+		var key string
+		err := gocty.FromCtyValue(k, &key)
+		if err != nil {
+			logging.Logger.WithError(err).Debugf("could not convert block map key to string ignoring entry")
+			continue
+		}
 
 		if (blockType == "resource" || blockType == "module") && key == "count" {
 			continue
